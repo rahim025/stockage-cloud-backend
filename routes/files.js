@@ -1,120 +1,157 @@
 const express = require('express');
 const multer = require('multer');
-const path = require('path');
-const fs = require('fs');
 const { v4: uuidv4 } = require('uuid');
-const db = require('../models/db');
+const { createClient } = require('@supabase/supabase-js');
+const { pool } = require('../models/db');
 const verifierToken = require('../middleware/auth');
 const determinerCategorie = require('../utils/categorie');
 
 const router = express.Router();
-const STORAGE_DIR = process.env.STORAGE_DIR || './uploads';
+
+// Client Supabase (clé "service_role" — a le droit d'écrire dans le bucket,
+// ne doit JAMAIS être exposée côté client/app mobile)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const BUCKET = process.env.SUPABASE_BUCKET || 'fichiers';
+
 // Taille max par fichier (par défaut 5 Go) — les erreurs multer sont interceptées
 // par le middleware gestionnaireErreurs
 const TAILLE_MAX_FICHIER = parseInt(process.env.TAILLE_MAX_FICHIER, 10) || 5 * 1024 * 1024 * 1024;
 
-// Stockage temporaire sur disque, dossier par utilisateur, nom aléatoire pour éviter les collisions
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const dossierUser = path.join(STORAGE_DIR, req.userId);
-    fs.mkdirSync(dossierUser, { recursive: true });
-    cb(null, dossierUser);
-  },
-  filename: (req, file, cb) => {
-    const nomStockage = `${uuidv4()}${path.extname(file.originalname)}`;
-    cb(null, nomStockage);
-  }
-});
-
-const upload = multer({ storage, limits: { fileSize: TAILLE_MAX_FICHIER } });
+// Upload en mémoire (buffer) — plus d'écriture sur disque, le fichier part direct vers Supabase Storage
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: TAILLE_MAX_FICHIER } });
 
 // Upload d'un fichier — vérifie le quota avant d'accepter
-router.post('/upload', verifierToken, upload.single('fichier'), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ erreur: 'Aucun fichier reçu' });
+router.post('/upload', verifierToken, upload.single('fichier'), async (req, res, next) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ erreur: 'Aucun fichier reçu' });
+    }
+
+    const { rows } = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    const utilisateur = rows[0];
+    const espaceActuel = Number(utilisateur.espace_utilise);
+    const nouvelEspaceUtilise = espaceActuel + req.file.size;
+
+    if (nouvelEspaceUtilise > Number(utilisateur.quota_octets)) {
+      return res.status(413).json({ erreur: 'Quota de stockage dépassé' });
+    }
+
+    const categorie = determinerCategorie(req.file.mimetype, req.body.categorie);
+    const id = uuidv4();
+    const extension = req.file.originalname.includes('.')
+      ? req.file.originalname.split('.').pop()
+      : '';
+    const nomStockage = extension ? `${uuidv4()}.${extension}` : uuidv4();
+    // Chemin dans le bucket, préfixé par l'utilisateur pour isoler ses fichiers
+    const cheminStockage = `${req.userId}/${nomStockage}`;
+
+    const { error: erreurUpload } = await supabase.storage
+      .from(BUCKET)
+      .upload(cheminStockage, req.file.buffer, { contentType: req.file.mimetype });
+
+    if (erreurUpload) {
+      return res.status(500).json({ erreur: `Échec de l'upload vers le stockage : ${erreurUpload.message}` });
+    }
+
+    await pool.query(
+      `INSERT INTO files (id, user_id, nom_original, nom_stockage, categorie, taille_octets, type_mime)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, req.userId, req.file.originalname, cheminStockage, categorie, req.file.size, req.file.mimetype]
+    );
+
+    await pool.query('UPDATE users SET espace_utilise = $1 WHERE id = $2', [nouvelEspaceUtilise, req.userId]);
+
+    res.status(201).json({
+      message: 'Fichier envoyé avec succès',
+      fichier: { id, nom: req.file.originalname, categorie, taille_octets: req.file.size }
+    });
+  } catch (err) {
+    next(err);
   }
-
-  const utilisateur = db.prepare('SELECT * FROM users WHERE id = ?').get(req.userId);
-  const nouvelEspaceUtilise = utilisateur.espace_utilise + req.file.size;
-
-  if (nouvelEspaceUtilise > utilisateur.quota_octets) {
-    fs.unlinkSync(req.file.path); // on retire le fichier, quota dépassé
-    return res.status(413).json({ erreur: 'Quota de stockage dépassé' });
-  }
-
-  const categorie = determinerCategorie(req.file.mimetype, req.body.categorie);
-  const id = uuidv4();
-
-  db.prepare(`
-    INSERT INTO files (id, user_id, nom_original, nom_stockage, categorie, taille_octets, type_mime)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, req.userId, req.file.originalname, req.file.filename, categorie, req.file.size, req.file.mimetype);
-
-  db.prepare('UPDATE users SET espace_utilise = ? WHERE id = ?').run(nouvelEspaceUtilise, req.userId);
-
-  res.status(201).json({
-    message: 'Fichier envoyé avec succès',
-    fichier: { id, nom: req.file.originalname, categorie, taille_octets: req.file.size }
-  });
 });
 
 // Liste des fichiers de l'utilisateur, filtrable par catégorie
-router.get('/', verifierToken, (req, res) => {
-  const { categorie } = req.query;
+router.get('/', verifierToken, async (req, res, next) => {
+  try {
+    const { categorie } = req.query;
 
-  let fichiers;
-  if (categorie) {
-    fichiers = db.prepare('SELECT * FROM files WHERE user_id = ? AND categorie = ? ORDER BY created_at DESC')
-      .all(req.userId, categorie);
-  } else {
-    fichiers = db.prepare('SELECT * FROM files WHERE user_id = ? ORDER BY created_at DESC').all(req.userId);
+    const { rows: fichiers } = categorie
+      ? await pool.query(
+          'SELECT * FROM files WHERE user_id = $1 AND categorie = $2 ORDER BY created_at DESC',
+          [req.userId, categorie]
+        )
+      : await pool.query('SELECT * FROM files WHERE user_id = $1 ORDER BY created_at DESC', [req.userId]);
+
+    res.json({ fichiers });
+  } catch (err) {
+    next(err);
   }
-
-  res.json({ fichiers });
 });
 
-// Téléchargement d'un fichier
-router.get('/:id/telecharger', verifierToken, (req, res) => {
-  const fichier = db.prepare('SELECT * FROM files WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
+// Téléchargement d'un fichier — génère une URL signée temporaire vers Supabase Storage
+router.get('/:id/telecharger', verifierToken, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM files WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
+    const fichier = rows[0];
 
-  if (!fichier) {
-    return res.status(404).json({ erreur: 'Fichier introuvable' });
+    if (!fichier) {
+      return res.status(404).json({ erreur: 'Fichier introuvable' });
+    }
+
+    // URL valable 60 secondes, avec le nom d'origine pour le téléchargement
+    const { data, error } = await supabase.storage
+      .from(BUCKET)
+      .createSignedUrl(fichier.nom_stockage, 60, { download: fichier.nom_original });
+
+    if (error) {
+      return res.status(500).json({ erreur: `Échec de la génération du lien : ${error.message}` });
+    }
+
+    res.json({ url_telechargement: data.signedUrl });
+  } catch (err) {
+    next(err);
   }
-
-  const cheminFichier = path.join(STORAGE_DIR, req.userId, fichier.nom_stockage);
-  res.download(cheminFichier, fichier.nom_original);
 });
 
 // Suppression d'un fichier
-router.delete('/:id', verifierToken, (req, res) => {
-  const fichier = db.prepare('SELECT * FROM files WHERE id = ? AND user_id = ?').get(req.params.id, req.userId);
+router.delete('/:id', verifierToken, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM files WHERE id = $1 AND user_id = $2', [req.params.id, req.userId]);
+    const fichier = rows[0];
 
-  if (!fichier) {
-    return res.status(404).json({ erreur: 'Fichier introuvable' });
+    if (!fichier) {
+      return res.status(404).json({ erreur: 'Fichier introuvable' });
+    }
+
+    await supabase.storage.from(BUCKET).remove([fichier.nom_stockage]);
+
+    await pool.query('DELETE FROM files WHERE id = $1', [req.params.id]);
+
+    const { rows: userRows } = await pool.query('SELECT espace_utilise FROM users WHERE id = $1', [req.userId]);
+    const nouvelEspace = Math.max(0, Number(userRows[0].espace_utilise) - Number(fichier.taille_octets));
+    await pool.query('UPDATE users SET espace_utilise = $1 WHERE id = $2', [nouvelEspace, req.userId]);
+
+    res.json({ message: 'Fichier supprimé avec succès' });
+  } catch (err) {
+    next(err);
   }
-
-  const cheminFichier = path.join(STORAGE_DIR, req.userId, fichier.nom_stockage);
-  if (fs.existsSync(cheminFichier)) {
-    fs.unlinkSync(cheminFichier);
-  }
-
-  db.prepare('DELETE FROM files WHERE id = ?').run(req.params.id);
-
-  const utilisateur = db.prepare('SELECT espace_utilise FROM users WHERE id = ?').get(req.userId);
-  const nouvelEspace = Math.max(0, utilisateur.espace_utilise - fichier.taille_octets);
-  db.prepare('UPDATE users SET espace_utilise = ? WHERE id = ?').run(nouvelEspace, req.userId);
-
-  res.json({ message: 'Fichier supprimé avec succès' });
 });
 
 // Quota utilisé / restant
-router.get('/quota', verifierToken, (req, res) => {
-  const utilisateur = db.prepare('SELECT quota_octets, espace_utilise FROM users WHERE id = ?').get(req.userId);
-  res.json({
-    quota_octets: utilisateur.quota_octets,
-    espace_utilise: utilisateur.espace_utilise,
-    espace_restant: utilisateur.quota_octets - utilisateur.espace_utilise
-  });
+router.get('/quota', verifierToken, async (req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT quota_octets, espace_utilise FROM users WHERE id = $1', [req.userId]);
+    const utilisateur = rows[0];
+    const quota = Number(utilisateur.quota_octets);
+    const utilise = Number(utilisateur.espace_utilise);
+    res.json({
+      quota_octets: quota,
+      espace_utilise: utilise,
+      espace_restant: quota - utilise
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 module.exports = router;
