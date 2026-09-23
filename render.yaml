@@ -12,13 +12,13 @@ services:
         value: "2199023255552"
       - key: TAILLE_MAX_FICHIER
         value: "5368709120"
-      - key: STORAGE_DIR
-        value: ./uploads
-      - key: DB_FILE
-        value: ./data.db
+      - key: DATABASE_URL
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: fichiers
       - key: ORIGINE_AUTORISEE
         value: "*"
-    disk:
-      name: stockage-data
-      mountPath: /opt/render/project/src/uploads
-      sizeGB: 10
