@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: stockage-cloud-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: JWT_SECRET
+        sync: false
+      - key: QUOTA_PAR_UTILISATEUR
+        value: "2199023255552"
+      - key: TAILLE_MAX_FICHIER
+        value: "5368709120"
+      - key: STORAGE_DIR
+        value: ./uploads
+      - key: DB_FILE
+        value: ./data.db
+      - key: ORIGINE_AUTORISEE
+        value: "*"
+    disk:
+      name: stockage-data
+      mountPath: /opt/render/project/src/uploads
+      sizeGB: 10
